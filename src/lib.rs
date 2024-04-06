@@ -1,19 +1,20 @@
-mod core;
-mod domain;
-mod runtime;
-
-use std::collections::HashSet;
+use std::error::Error;
 use std::io;
 use std::path::PathBuf;
 
-use crate::core::repository::{Getter, Saver};
-use crate::core::{EventSourced, GetError, Handler, InMemory};
-use crate::domain::{Account, BankAccountRoot, Transaction, TransactionEvent, TransactionType};
-use crate::runtime::Service;
 use clap::Parser;
 use csv::Trim;
 use either::Either;
 use tap::Pipe;
+
+use crate::core::repository::{Getter};
+use crate::core::{EventSourced, InMemory};
+use crate::domain::{Account, BankAccountRoot, Transaction, TransactionEvent};
+use crate::runtime::{ConnectorError, Read, Runtime, Service};
+
+mod core;
+mod domain;
+mod runtime;
 
 #[derive(Parser, Clone, Debug)]
 pub struct Args {
@@ -74,72 +75,41 @@ impl From<InputType> for InputProcessor {
     }
 }
 
+impl Read for InputProcessor {
+    type Request = Transaction;
+
+    fn recv(&mut self) -> Result<Self::Request, Box<dyn Error + Send + Sync + 'static>> {
+        self.rx
+            .recv()
+            .map_err(Box::<dyn Error + Send + Sync + 'static>::from)
+            .map_err(ConnectorError::Other)
+            .map_err(Into::into)
+    }
+}
+
 pub async fn run() -> anyhow::Result<()> {
+    let tracer = tracing_subscriber::FmtSubscriber::builder()
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    tracing::subscriber::set_global_default(tracer)?;
+
+    tracing::info!("startup");
+    tracing::error!("this is an error");
+
     let args = Args::parse();
 
-    let processor = InputProcessor::from(args.input);
     let event_store = InMemory::<u16, TransactionEvent>::default();
     let account_repository = EventSourced::<Account, _>::from(event_store);
     let application_service = Service::from(account_repository.clone());
 
-    let mut account_ids = HashSet::new();
-    while let Ok(tx) = processor.rx.recv() {
-        account_ids.insert(tx.client_id);
-        if let Err(err) = application_service.handle(tx.into()).await {
-            println!("transaction error {:?}", err)
-        }
-        // match tx.transaction_type {
-        //     TransactionType::Deposit => {
-        //         match account_repository.get(&tx.client_id).await {
-        //             Ok(account) => {
-        //                 let mut root = BankAccountRoot::from(account);
-        //                 root.deposit(tx).unwrap();
-        //                 account_repository.save(&mut root).await.unwrap();
-        //             }
-        //             Err(err) if matches!(GetError::NotFound, err) => {
-        //                 let mut root = BankAccountRoot::open(tx.clone()).expect("new account root");
-        //                 account_repository
-        //                     .save(&mut root)
-        //                     .await
-        //                     .expect("new account version should be saved successfully");
-        //             }
-        //             Err(err) => {
-        //                 panic!("{}", err);
-        //             }
-        //         };
-        //     }
-        //     TransactionType::Withdrawal => {
-        //         // println!("withdrawal for client_id {:?} with amount {:?}", tx.client_id, tx.amount);
-        //         let mut root: BankAccountRoot =
-        //             account_repository.get(&tx.client_id).await.unwrap().into();
-        //         if let Ok(_) = root.withdrawal(tx) {
-        //             account_repository.save(&mut root).await.unwrap()
-        //         }
-        //     }
-        //     TransactionType::Dispute => {
-        //         let mut root: BankAccountRoot =
-        //             account_repository.get(&tx.client_id).await.unwrap().into();
-        //         root.dispute(tx).unwrap();
-        //         account_repository.save(&mut root).await.unwrap()
-        //     }
-        //     TransactionType::Resolve => {
-        //         let mut root: BankAccountRoot =
-        //             account_repository.get(&tx.client_id).await.unwrap().into();
-        //         root.resolve(tx).unwrap();
-        //         account_repository.save(&mut root).await.unwrap()
-        //     }
-        //     TransactionType::Chargeback => {
-        //         let mut root: BankAccountRoot =
-        //             account_repository.get(&tx.client_id).await.unwrap().into();
-        //         root.chargeback(tx).unwrap();
-        //         account_repository.save(&mut root).await.unwrap()
-        //     }
-        // }
-    }
+    let engine = Runtime::new(application_service)
+        .with_connector("stdin_or_file", InputProcessor::from(args.input))?;
+
+    let engine = engine.run().await?;
 
     let mut wtr = csv::Writer::from_writer(io::stdout());
-    for id in account_ids {
-        let mut root: BankAccountRoot = account_repository.get(&id).await.unwrap().into();
+    for id in engine.account_ids() {
+        let root: BankAccountRoot = account_repository.get(id).await?.into();
         wtr.serialize(&root.snapshot())?;
     }
     wtr.flush()?;

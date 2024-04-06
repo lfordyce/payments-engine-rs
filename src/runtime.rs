@@ -1,13 +1,17 @@
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
+use std::error::Error as StdError;
+use std::future::Future;
+use std::marker::PhantomData;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use thiserror::Error;
+
 use crate::core::repository::Repository;
 use crate::core::{Envelope, GetError, Handler};
 use crate::domain::{Account, BankAccountRoot, Transaction, TransactionType};
 use crate::runtime::sealed::State;
-use async_trait::async_trait;
-use std::error::Error as StdError;
-use std::fmt::Error;
-use std::marker::PhantomData;
-use std::sync::Arc;
-use thiserror::Error;
 
 pub trait Read {
     type Request;
@@ -44,12 +48,11 @@ impl Handler<Transaction> for Service {
                     root.deposit(command)?;
                     self.repository.save(&mut root).await?
                 }
-                Err(err) if matches!(GetError::NotFound, err) => {
-                    let mut root =
-                        BankAccountRoot::open(command.clone()).expect("new account root");
+                Err(_err) if matches!(GetError::NotFound, _err) => {
+                    let mut root = BankAccountRoot::open(command.clone())?;
                     self.repository.save(&mut root).await?
                 }
-                Err(err) => (),
+                Err(_err) => (),
             },
             TransactionType::Withdrawal => {
                 let mut root: BankAccountRoot =
@@ -90,13 +93,106 @@ pub enum ConnectorError {
     Other(#[from] Box<dyn StdError + Send + Sync + 'static>),
 }
 
+/// An executor of futures.
+pub trait Executor {
+    /// Place the future into the executor to be run.
+    fn execute<F>(&self, future: F)
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static;
+}
+
+#[derive(Clone, Copy)]
+pub struct TokioExecutor;
+
+impl Executor for TokioExecutor {
+    fn execute<F>(&self, future: F)
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        tokio::task::spawn(future);
+    }
+}
+
 pub struct Runtime<E, S: State> {
-    repository: Arc<dyn Repository<Account>>,
+    svc: Service,
+    connector: HashMap<String, Box<dyn Read<Request = Transaction> + Send>>,
     executor: E,
+    account_ids: HashSet<u16>,
     _state: PhantomData<S>,
 }
 
-impl<E> Runtime<E, Idle> {}
+impl Runtime<TokioExecutor, Idle> {
+    pub fn new(svc: Service) -> Self {
+        Runtime {
+            svc,
+            connector: Default::default(),
+            executor: TokioExecutor,
+            account_ids: HashSet::new(),
+            _state: PhantomData,
+        }
+    }
+}
+
+impl<E, S: State> Runtime<E, S> {
+    #[inline]
+    pub const fn account_ids(&self) -> &HashSet<u16> {
+        &self.account_ids
+    }
+}
+
+impl<E> Runtime<E, Idle> {
+    pub fn with_connector(
+        mut self,
+        connector_id: impl Into<String>,
+        connector: impl Read<Request = Transaction> + Send + 'static,
+    ) -> Result<Self, ConnectorError> {
+        let Entry::Vacant(entry) = self.connector.entry(connector_id.into()) else {
+            return Err(ConnectorError::Duplicated)?;
+        };
+
+        entry.insert(Box::new(connector));
+        Ok(self)
+    }
+
+    pub async fn run(mut self) -> anyhow::Result<Runtime<E, Dead>>
+    where
+        E: Executor,
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for (connector_name, mut connector) in self.connector.drain() {
+            let tx = tx.clone();
+            self.executor.execute(async move {
+                while let Ok(request) = connector.recv() {
+                    if let Err(err) = tx.send(request) {
+                        eprintln!("connector `{connector_name}` failed: {err}");
+                        break;
+                    }
+                }
+            });
+        }
+
+        drop(tx);
+
+        while let Ok(request) = rx.recv() {
+            self.account_ids.insert(request.client_id);
+            if let Err(err) = self.svc.handle(request.into()).await {
+                tracing::warn!(error=?err, "Error processing transaction:");
+            }
+        }
+
+        let runtime = Runtime {
+            svc: self.svc,
+            connector: self.connector,
+            executor: self.executor,
+            account_ids: self.account_ids,
+            _state: PhantomData,
+        };
+
+        Ok(runtime)
+    }
+}
 
 pub enum Idle {}
 pub enum Dead {}

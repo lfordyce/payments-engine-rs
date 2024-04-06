@@ -1,8 +1,10 @@
-use crate::core::{Aggregate, Message, Root};
+use std::collections::hash_map::Entry;
+use std::collections::HashMap;
+
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+
+use crate::core::{Aggregate, Message, Root};
 
 /// Transaction type enum
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
@@ -49,22 +51,6 @@ impl Message for Transaction {
 }
 
 impl Transaction {
-    pub fn is_withdrawal(&self) -> bool {
-        matches!(self.transaction_type, TransactionType::Withdrawal)
-    }
-
-    // In the event a dispute happens for a with
-    pub fn amount_with_sign(&self) -> Option<Decimal> {
-        if self.is_withdrawal() {
-            self.amount.map(|mut d| {
-                d.set_sign_negative(true);
-                d
-            })
-        } else {
-            self.amount
-        }
-    }
-
     pub fn can_be_disputed(&self) -> bool {
         self.status == Status::Ok
             && (self.transaction_type == TransactionType::Withdrawal
@@ -136,6 +122,8 @@ pub enum BankAccountError {
     NoMoneyDeposited,
     #[error("transfer could not be sent due to insufficient funds")]
     InsufficientFunds,
+    #[error("Associated Transaction `{0}` is missing an amount when one is expected")]
+    MissingAmount(u32),
     #[error("transfer transaction was destined to a different recipient: {0}")]
     WrongTransactionRecipient(u32),
     #[error("the account is closed")]
@@ -201,7 +189,7 @@ impl Aggregate for Account {
                     account_holder_id,
                 } => Ok(Account {
                     id: account_holder_id,
-                    balance: Balance::new(transaction.amount.unwrap_or_default()),
+                    balance: Balance::new(transaction.amount.ok_or(BankAccountError::NoMoneyDeposited)?),
                     pending_transactions: HashMap::from([(tx_id, transaction)]),
                     locked: false,
                 }),
@@ -333,7 +321,7 @@ impl BankAccountRoot {
         }
         self.record_that(
             TransactionEvent::DepositWasRecorded {
-                amount: transaction.amount.unwrap_or_default(),
+                amount: transaction.amount.ok_or(BankAccountError::NoMoneyDeposited)?,
                 transaction,
             }
             .into(),
@@ -344,13 +332,13 @@ impl BankAccountRoot {
         if self.locked {
             return Err(BankAccountError::Closed);
         }
-        if self.balance.available < transaction.amount.unwrap() {
+        if self.balance.available < transaction.amount.ok_or(BankAccountError::NoMoneyDeposited)? {
             return Err(BankAccountError::InsufficientFunds);
         }
 
         self.record_that(
             TransactionEvent::WithdrawalWasRecorded {
-                amount: transaction.amount.unwrap(),
+                amount: transaction.amount.ok_or(BankAccountError::NoMoneyDeposited)?,
                 transaction,
             }
             .into(),
@@ -365,7 +353,7 @@ impl BankAccountRoot {
                     self.record_that(
                         TransactionEvent::DisputeWasRecorded {
                             tx_id: disputed.tx_id,
-                            amount: disputed.amount.unwrap(),
+                            amount: disputed.amount.ok_or(BankAccountError::NoMoneyDeposited)?,
                         }
                         .into(),
                     )
@@ -386,7 +374,7 @@ impl BankAccountRoot {
                     let disputed = disputed_tx.clone();
                     self.record_that(
                         TransactionEvent::ResolveWasRecorded {
-                            amount: disputed.amount.unwrap(),
+                            amount: disputed.amount.ok_or(BankAccountError::NoMoneyDeposited)?,
                             tx_id: disputed.tx_id,
                         }
                         .into(),
@@ -407,7 +395,7 @@ impl BankAccountRoot {
                 let disputed = disputed_tx.clone();
                 self.record_that(
                     TransactionEvent::ChargebackWasRecorded {
-                        amount: disputed.amount.unwrap(),
+                        amount: disputed.amount.ok_or(BankAccountError::NoMoneyDeposited)?,
                         tx_id: disputed.tx_id,
                     }
                     .into(),
@@ -432,10 +420,12 @@ impl BankAccountRoot {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::core::repository::{Getter, Saver};
-    use crate::core::{EventSourced, GetError, InMemory};
     use rust_decimal_macros::dec;
+
+    use crate::core::{EventSourced, GetError, InMemory};
+    use crate::core::repository::{Getter, Saver};
+
+    use super::*;
 
     #[tokio::test]
     async fn repository_persists_new_aggregate_root() {
@@ -449,8 +439,6 @@ mod tests {
             amount: Some(dec!(10.89)),
             transaction_type: TransactionType::Deposit,
         };
-
-        // let a = account_repository.get(&dpstt.client_id).await.map_err(|e| match )?;
 
         if dpstt.transaction_type == TransactionType::Deposit {
             match account_repository.get(&dpstt.client_id).await {
