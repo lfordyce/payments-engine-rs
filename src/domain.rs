@@ -1,6 +1,7 @@
 use crate::core::{Aggregate, Message, Root};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 /// Transaction type enum
@@ -14,8 +15,20 @@ pub enum TransactionType {
     Chargeback,
 }
 
-#[derive(Debug, Deserialize, Serialize, PartialEq, Clone)]
-pub struct TransactionEvent {
+#[derive(Default, Debug, Serialize, Deserialize, Eq, PartialEq, Clone)]
+pub enum Status {
+    #[default]
+    Ok,
+    Disputed,
+    ChargedBack,
+    Declined,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Clone, Eq)]
+pub struct Transaction {
+    /// Used internally
+    #[serde(skip, default)]
+    pub status: Status,
     /// Client ID
     #[serde(rename = "client")]
     pub client_id: u16,
@@ -29,14 +42,80 @@ pub struct TransactionEvent {
     pub amount: Option<Decimal>,
 }
 
+impl Message for Transaction {
+    fn name(&self) -> &'static str {
+        "InboundTransaction"
+    }
+}
+
+impl Transaction {
+    pub fn is_withdrawal(&self) -> bool {
+        matches!(self.transaction_type, TransactionType::Withdrawal)
+    }
+
+    // In the event a dispute happens for a with
+    pub fn amount_with_sign(&self) -> Option<Decimal> {
+        if self.is_withdrawal() {
+            self.amount.map(|mut d| {
+                d.set_sign_negative(true);
+                d
+            })
+        } else {
+            self.amount
+        }
+    }
+
+    pub fn can_be_disputed(&self) -> bool {
+        self.status == Status::Ok
+            && (self.transaction_type == TransactionType::Withdrawal
+                || self.transaction_type == TransactionType::Deposit)
+    }
+
+    pub fn can_complete_dispute(&self) -> bool {
+        self.status == Status::Disputed
+            && (self.transaction_type == TransactionType::Withdrawal
+                || self.transaction_type == TransactionType::Deposit)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransactionEvent {
+    WasOpened {
+        tx_id: u32,
+        account_holder_id: u16,
+        transaction: Transaction,
+    },
+    DepositWasRecorded {
+        amount: Decimal,
+        transaction: Transaction,
+    },
+    WithdrawalWasRecorded {
+        amount: Decimal,
+        transaction: Transaction,
+    },
+    DisputeWasRecorded {
+        tx_id: u32,
+        amount: Decimal,
+    },
+    ResolveWasRecorded {
+        tx_id: u32,
+        amount: Decimal,
+    },
+    ChargebackWasRecorded {
+        tx_id: u32,
+        amount: Decimal,
+    },
+}
+
 impl Message for TransactionEvent {
     fn name(&self) -> &'static str {
-        match self.transaction_type {
-            TransactionType::Deposit => "Deposit",
-            TransactionType::Withdrawal => "Withdrawal",
-            TransactionType::Dispute => "Dispute",
-            TransactionType::Resolve => "Resolve",
-            TransactionType::Chargeback => "Chargeback",
+        match self {
+            TransactionEvent::WasOpened { .. } => "Opened",
+            TransactionEvent::DepositWasRecorded { .. } => "Deposit",
+            TransactionEvent::WithdrawalWasRecorded { .. } => "Withdrawal",
+            TransactionEvent::DisputeWasRecorded { .. } => "Dispute",
+            TransactionEvent::ResolveWasRecorded { .. } => "Resolve",
+            TransactionEvent::ChargebackWasRecorded { .. } => "Chargeback",
         }
     }
 }
@@ -58,47 +137,11 @@ pub enum BankAccountError {
     #[error("transfer could not be sent due to insufficient funds")]
     InsufficientFunds,
     #[error("transfer transaction was destined to a different recipient: {0}")]
-    WrongTransactionRecipient(u16),
+    WrongTransactionRecipient(u32),
     #[error("the account is closed")]
     Closed,
     #[error("bank account has already been closed")]
     AlreadyClosed,
-}
-
-#[derive(Default, Debug, Serialize, Deserialize, Eq, PartialEq, Clone)]
-pub enum TransactionStatus {
-    #[default]
-    Ok,
-    Disputed,
-    Chargedback,
-    Declined,
-}
-
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize, Clone)]
-pub struct Transaction {
-    #[serde(skip, default)]
-    pub status: TransactionStatus,
-
-    #[serde(rename = "type")]
-    pub transaction_type: TransactionType,
-
-    pub id: u32,
-    pub beneficiary_account_id: u16,
-    pub amount: Option<Decimal>,
-}
-
-impl Transaction {
-    pub fn can_be_disputed(&self) -> bool {
-        self.status == TransactionStatus::Ok
-            && (self.transaction_type == TransactionType::Withdrawal
-                || self.transaction_type == TransactionType::Deposit)
-    }
-
-    pub fn can_complete_dispute(&self) -> bool {
-        self.status == TransactionStatus::Disputed
-            && (self.transaction_type == TransactionType::Withdrawal
-                || self.transaction_type == TransactionType::Deposit)
-    }
 }
 
 /// Balance for the account
@@ -119,13 +162,20 @@ impl Balance {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+pub struct AccountSnapShot {
+    client: u16,
+    available: Decimal,
+    held: Decimal,
+    total: Decimal,
+    locked: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Account {
     id: u16,
     balance: Balance,
     pending_transactions: HashMap<u32, Transaction>,
-    disputed_transactions: HashSet<u32>,
-    previous_tx_id: u32,
     locked: bool,
 }
 
@@ -144,49 +194,97 @@ impl Aggregate for Account {
 
     fn apply(state: Option<Self>, event: Self::Event) -> Result<Self, Self::Error> {
         match state {
-            None => match event.transaction_type {
-                TransactionType::Deposit => {
-                    let mut account = Account {
-                        id: event.client_id,
-                        balance: Balance::new(event.amount.unwrap_or_default()),
-                        pending_transactions: HashMap::new(),
-                        disputed_transactions: HashSet::new(),
-                        previous_tx_id: event.tx_id,
-                        locked: false,
-                    };
-                    account.pending_transactions.insert(
-                        event.tx_id,
-                        Transaction {
-                            status: TransactionStatus::Ok,
-                            transaction_type: TransactionType::Deposit,
-                            id: event.tx_id,
-                            beneficiary_account_id: event.client_id,
-                            amount: event.amount,
-                        },
-                    );
-                    account.previous_tx_id = event.tx_id;
-                    Ok(account)
-                }
+            None => match event {
+                TransactionEvent::WasOpened {
+                    transaction,
+                    tx_id,
+                    account_holder_id,
+                } => Ok(Account {
+                    id: account_holder_id,
+                    balance: Balance::new(transaction.amount.unwrap_or_default()),
+                    pending_transactions: HashMap::from([(tx_id, transaction)]),
+                    locked: false,
+                }),
                 _ => Err(BankAccountError::NotOpenedYet),
             },
-            Some(mut account) => match event.transaction_type {
-                TransactionType::Deposit => {
-                    if let Some(amount) = event.amount {
-                        if !account.locked {
-                            account.balance.available += amount;
-                        }
+            Some(mut account) => match event {
+                TransactionEvent::WasOpened { .. } => Err(BankAccountError::AlreadyOpened),
+                TransactionEvent::DepositWasRecorded {
+                    amount,
+                    transaction,
+                } => {
+                    account.balance.available += amount;
+                    account
+                        .pending_transactions
+                        .insert(transaction.tx_id, transaction);
+                    Ok(account)
+                }
+                TransactionEvent::WithdrawalWasRecorded {
+                    amount,
+                    transaction,
+                } => {
+                    account.balance.available -= amount;
+                    account
+                        .pending_transactions
+                        .insert(transaction.tx_id, transaction);
+                    Ok(account)
+                }
+                TransactionEvent::DisputeWasRecorded { tx_id, amount } => {
+                    match account
+                        .pending_transactions
+                        .entry(tx_id)
+                        .and_modify(|tx| tx.status = Status::Disputed) {
+                        Entry::Occupied(t) => match t.get().transaction_type {
+                            TransactionType::Deposit => {
+                                account.balance.held += amount;
+                                account.balance.available -= amount;
+                            }
+                            TransactionType::Withdrawal => {
+                                account.balance.held += amount;
+                            }
+                            _ => {}
+                        },
+                        Entry::Vacant(_) => {}
                     }
                     Ok(account)
                 }
-                TransactionType::Withdrawal => {
-                    if !account.locked && account.balance.available >= event.amount.unwrap() {
-                        account.balance.available -= event.amount.unwrap();
+                TransactionEvent::ResolveWasRecorded { tx_id, amount } => {
+                    match account
+                        .pending_transactions
+                        .entry(tx_id)
+                        .and_modify(|tx| tx.status = Status::Ok)
+                    {
+                        Entry::Occupied(t) => match t.get().transaction_type {
+                            TransactionType::Deposit => {
+                                account.balance.held -= amount;
+                            }
+                            TransactionType::Withdrawal => {
+                                account.balance.held -= amount;
+                                account.balance.available += amount;
+                            }
+                            _ => {}
+                        },
+                        Entry::Vacant(_) => {}
                     }
                     Ok(account)
                 }
-                TransactionType::Dispute => Err(BankAccountError::NotOpenedYet),
-                TransactionType::Resolve => Err(BankAccountError::NotOpenedYet),
-                TransactionType::Chargeback => Err(BankAccountError::NotOpenedYet),
+                TransactionEvent::ChargebackWasRecorded { tx_id, amount } => {
+                    match account
+                        .pending_transactions
+                        .entry(tx_id)
+                        .and_modify(|tx| tx.status = Status::ChargedBack)
+                    {
+                        Entry::Occupied(t) => match t.get().transaction_type {
+                            TransactionType::Deposit | TransactionType::Withdrawal => {
+                                account.balance.held -= amount;
+                                account.locked = true;
+                            }
+                            _ => {}
+                        },
+                        Entry::Vacant(_) => {}
+                    }
+                    Ok(account)
+                }
             },
         }
     }
@@ -217,41 +315,165 @@ impl From<BankAccountRoot> for Root<Account> {
 }
 
 impl BankAccountRoot {
-    pub fn create(evt: TransactionEvent) -> Result<Self, BankAccountError> {
-        Root::<Account>::record_new(evt.into()).map(Self)
+    pub fn open(transaction: Transaction) -> Result<Self, BankAccountError> {
+        Root::<Account>::record_new(
+            TransactionEvent::WasOpened {
+                account_holder_id: transaction.client_id,
+                tx_id: transaction.tx_id,
+                transaction,
+            }
+            .into(),
+        )
+        .map(Self)
+    }
+
+    pub fn deposit(&mut self, transaction: Transaction) -> Result<(), BankAccountError> {
+        if self.locked {
+            return Err(BankAccountError::Closed);
+        }
+        self.record_that(
+            TransactionEvent::DepositWasRecorded {
+                amount: transaction.amount.unwrap_or_default(),
+                transaction,
+            }
+            .into(),
+        )
+    }
+
+    pub fn withdrawal(&mut self, transaction: Transaction) -> Result<(), BankAccountError> {
+        if self.locked {
+            return Err(BankAccountError::Closed);
+        }
+        if self.balance.available < transaction.amount.unwrap() {
+            return Err(BankAccountError::InsufficientFunds);
+        }
+
+        self.record_that(
+            TransactionEvent::WithdrawalWasRecorded {
+                amount: transaction.amount.unwrap(),
+                transaction,
+            }
+            .into(),
+        )
+    }
+
+    pub fn dispute(&mut self, transaction: Transaction) -> Result<(), BankAccountError> {
+        match self.pending_transactions.get(&transaction.tx_id) {
+            Some(disputed_tx) => {
+                if disputed_tx.can_be_disputed() {
+                    let disputed = disputed_tx.clone();
+                    self.record_that(
+                        TransactionEvent::DisputeWasRecorded {
+                            tx_id: disputed.tx_id,
+                            amount: disputed.amount.unwrap(),
+                        }
+                        .into(),
+                    )
+                } else {
+                    Err(BankAccountError::InsufficientFunds)
+                }
+            }
+            None => Err(BankAccountError::WrongTransactionRecipient(
+                transaction.tx_id,
+            )),
+        }
+    }
+
+    pub fn resolve(&mut self, transaction: Transaction) -> Result<(), BankAccountError> {
+        match self.pending_transactions.get(&transaction.tx_id) {
+            Some(disputed_tx) => {
+                if disputed_tx.can_complete_dispute() {
+                    let disputed = disputed_tx.clone();
+                    self.record_that(
+                        TransactionEvent::ResolveWasRecorded {
+                            amount: disputed.amount.unwrap(),
+                            tx_id: disputed.tx_id,
+                        }
+                        .into(),
+                    )
+                } else {
+                    Err(BankAccountError::InsufficientFunds)
+                }
+            }
+            None => Err(BankAccountError::WrongTransactionRecipient(
+                transaction.tx_id,
+            )),
+        }
+    }
+
+    pub fn chargeback(&mut self, transaction: Transaction) -> Result<(), BankAccountError> {
+        match self.pending_transactions.get(&transaction.tx_id) {
+            Some(disputed_tx) if disputed_tx.can_complete_dispute() => {
+                let disputed = disputed_tx.clone();
+                self.record_that(
+                    TransactionEvent::ChargebackWasRecorded {
+                        amount: disputed.amount.unwrap(),
+                        tx_id: disputed.tx_id,
+                    }
+                    .into(),
+                )
+            }
+            _ => Err(BankAccountError::WrongTransactionRecipient(
+                transaction.tx_id,
+            )),
+        }
+    }
+
+    pub fn snapshot(&self) -> AccountSnapShot {
+        AccountSnapShot {
+            client: self.id,
+            available: self.balance.available.round_dp(4),
+            held: self.balance.held.round_dp(4),
+            total: (self.balance.available + self.balance.held).round_dp(4),
+            locked: self.locked,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::repository::{Getter, Saver};
     use crate::core::{EventSourced, GetError, InMemory};
     use rust_decimal_macros::dec;
-    use crate::core::repository::{Getter, Saver};
 
     #[tokio::test]
     async fn repository_persists_new_aggregate_root() {
         let event_store = InMemory::<u16, TransactionEvent>::default();
         let account_repository = EventSourced::<Account, _>::from(event_store);
 
-        let mut dpstt = TransactionEvent {
+        let mut dpstt = Transaction {
+            status: Default::default(),
             client_id: 1,
             tx_id: 1,
             amount: Some(dec!(10.89)),
             transaction_type: TransactionType::Deposit,
         };
 
-        match account_repository.get(&dpstt.client_id).await {
-            Ok(account) => {}
-            Err(err) => {
-                if matches!(GetError::NotFound, err) {
-                    let mut root = BankAccountRoot::create(dpstt.clone()).expect("new account root");
-                    account_repository.save(&mut root).await.expect("new account version should be saved successfully");
-                }
-            }
-        };
+        // let a = account_repository.get(&dpstt.client_id).await.map_err(|e| match )?;
 
-        let root = account_repository.get(&dpstt.client_id).await.expect("account record should have saved");
+        if dpstt.transaction_type == TransactionType::Deposit {
+            match account_repository.get(&dpstt.client_id).await {
+                Ok(account) => {
+                    let mut root = BankAccountRoot::from(account);
+                    root.deposit(dpstt.clone()).unwrap();
+                    account_repository.save(&mut root).await.unwrap();
+                }
+                Err(err) if matches!(GetError::NotFound, err) => {
+                    let mut root = BankAccountRoot::open(dpstt.clone()).expect("new account root");
+                    account_repository
+                        .save(&mut root)
+                        .await
+                        .expect("new account version should be saved successfully");
+                }
+                Err(err) => {}
+            };
+        }
+
+        let root = account_repository
+            .get(&dpstt.client_id)
+            .await
+            .expect("account record should have saved");
         assert_eq!(1, root.id);
     }
 }
