@@ -125,6 +125,12 @@ pub enum BankAccountError {
     DuplicateTransactionRecipient(u32),
     #[error("the account is closed")]
     Closed,
+    #[error("invalid transaction dispute")]
+    InvalidTransactionDispute,
+    #[error("invalid transaction chargeback")]
+    InvalidTransactionChargeBack,
+    #[error("invalid transaction resolution")]
+    InvalidTransactionResolution,
 }
 
 /// Balance for the account
@@ -228,17 +234,23 @@ impl Aggregate for Account {
                     {
                         Entry::Occupied(t) => match t.get().transaction_type {
                             TransactionType::Deposit => {
-                                account.balance.held += amount;
                                 account.balance.available -= amount;
+                                account.balance.held += amount;
+                                Ok(account)
                             }
                             TransactionType::Withdrawal => {
+                                if account.balance.available >= amount {
+                                    account.balance.available -= amount;
+                                }
                                 account.balance.held += amount;
+                                Ok(account)
                             }
-                            _ => {}
+                            _ => Err(BankAccountError::InvalidTransactionDispute),
                         },
-                        Entry::Vacant(_) => {}
+                        Entry::Vacant(_) => {
+                            unreachable!("this should never happen")
+                        }
                     }
-                    Ok(account)
                 }
                 TransactionEvent::ResolveWasRecorded { tx_id, amount } => {
                     match account
@@ -247,19 +259,27 @@ impl Aggregate for Account {
                         .and_modify(|tx| tx.status = Status::Ok)
                     {
                         Entry::Occupied(t) => match t.get().transaction_type {
+                            // TransactionType::Deposit | TransactionType::Withdrawal
+                            //     if account.balance.held >= amount =>
+                            // {
+                            //     account.balance.held -= amount;
+                            //     account.balance.available += amount;
+                            //     Ok(account)
+                            // }
                             TransactionType::Deposit => {
                                 account.balance.held -= amount;
                                 account.balance.available += amount;
+                                Ok(account)
                             }
                             TransactionType::Withdrawal => {
                                 account.balance.held -= amount;
                                 account.balance.available += amount;
+                                Ok(account)
                             }
-                            _ => {}
+                            _ => Err(BankAccountError::InvalidTransactionResolution),
                         },
-                        Entry::Vacant(_) => {}
+                        Entry::Vacant(_) => unreachable!(),
                     }
-                    Ok(account)
                 }
                 TransactionEvent::ChargebackWasRecorded { tx_id, amount } => {
                     match account
@@ -268,17 +288,19 @@ impl Aggregate for Account {
                         .and_modify(|tx| tx.status = Status::ChargedBack)
                     {
                         Entry::Occupied(t) => match t.get().transaction_type {
-                            TransactionType::Deposit | TransactionType::Withdrawal => {
-                                if account.balance.held >= amount {
-                                    account.balance.held -= amount;
-                                    account.locked = true;
-                                }
+                            TransactionType::Deposit | TransactionType::Withdrawal
+                                if account.balance.held >= amount =>
+                            {
+                                account.balance.held -= amount;
+                                account.locked = true;
+                                Ok(account)
                             }
-                            _ => {}
+                            _ => Err(BankAccountError::InvalidTransactionChargeBack),
                         },
-                        Entry::Vacant(_) => {}
+                        Entry::Vacant(_) => {
+                            unreachable!()
+                        }
                     }
-                    Ok(account)
                 }
             },
         }
