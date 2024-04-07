@@ -1,13 +1,14 @@
-use crate::core::aggregate::{Envelope, Message};
-use futures::stream::BoxStream;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::hash::Hash;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
+use futures::stream::BoxStream;
 use futures::stream::{iter, StreamExt};
+use serde::{Deserialize, Serialize};
+
+use crate::core::aggregate::{Envelope, Message};
 
 pub type Version = u64;
 
@@ -44,8 +45,6 @@ where
     ///
     /// This value is used for optimistic concurrency checks, to avoid
     /// data races in parallel command evaluations.
-    ///
-    /// Check the [Version][version::Version] type and module documentation for more info.
     pub version: Version,
 
     /// The actual Domain Event carried by this envelope.
@@ -59,7 +58,7 @@ pub enum VersionSelect {
     All,
 
     /// Selects all [Event][Envelope]s in the Event [Stream] starting from the [Event]
-    /// with the specified [Version][version::Version].
+    /// with the specified [Version].
     From(Version),
 }
 
@@ -102,7 +101,7 @@ where
 {
     /// Appens new Domain Events to the specified Event Stream.
     ///
-    /// The result of this operation is the new [Version][version::Version]
+    /// The result of this operation is the new [Version]
     /// of the Event Stream with the specified Domain Events added to it.
     async fn append(
         &self,
@@ -151,7 +150,7 @@ where
     }
 }
 
-/// In-memory implementation of [`event::Store`] trait,
+/// In-memory implementation of [Store] trait,
 /// backed by a thread-safe [`std::collections::HashMap`].
 #[derive(Debug, Clone)]
 pub struct InMemory<Id, Evt>
@@ -255,6 +254,139 @@ where
             .or_insert_with(|| persisted_events);
 
         Ok(new_last_event_stream_version)
+    }
+}
+
+#[cfg(any(test, feature = "test"))]
+#[doc(hidden)]
+pub mod __tracking {
+    use std::sync::{Arc, RwLock};
+
+    use async_trait::async_trait;
+
+    use crate::core::store::{
+        AppendError, Appender, Check, Store, Stream, Streamer, Version, VersionSelect,
+    };
+    use crate::core::{Envelope, Message, Persisted};
+
+    /// Decorator type for an [`event::Store`] implementation that tracks the list of
+    /// recorded Domain Events through it.
+    ///
+    /// Useful for testing purposes, i.e. asserting that Domain Events written throguh
+    /// this Event Store instance are the ones expected.
+    #[derive(Debug, Clone)]
+    pub struct Tracking<T, StreamId, Event>
+    where
+        T: Store<StreamId, Event> + Send + Sync,
+        StreamId: Send + Sync,
+        Event: Message + Send + Sync,
+    {
+        store: T,
+
+        #[allow(clippy::type_complexity)]
+        events: Arc<RwLock<Vec<Persisted<StreamId, Event>>>>,
+    }
+
+    impl<T, StreamId, Event> Tracking<T, StreamId, Event>
+    where
+        T: Store<StreamId, Event> + Send + Sync,
+        StreamId: Clone + Send + Sync,
+        Event: Message + Clone + Send + Sync,
+    {
+        /// Returns the list of recoded Domain Events through this decorator so far.
+        ///
+        /// # Panics
+        ///
+        /// Since the internal data is thread-safe through an [`RwLock`], this method
+        /// could potentially panic while attempting to get a read-only lock on the data recorded.
+        pub fn recorded_events(&self) -> Vec<Persisted<StreamId, Event>> {
+            self.events
+                .read()
+                .expect("acquire lock on recorded events list")
+                .clone()
+        }
+    }
+
+    impl<T, StreamId, Event> Streamer<StreamId, Event> for Tracking<T, StreamId, Event>
+    where
+        T: Store<StreamId, Event> + Send + Sync,
+        StreamId: Clone + Send + Sync,
+        Event: Message + Clone + Send + Sync,
+    {
+        type Error = <T as Streamer<StreamId, Event>>::Error;
+
+        fn stream(
+            &self,
+            id: &StreamId,
+            select: VersionSelect,
+        ) -> Stream<StreamId, Event, Self::Error> {
+            self.store.stream(id, select)
+        }
+    }
+
+    #[async_trait]
+    impl<T, StreamId, Event> Appender<StreamId, Event> for Tracking<T, StreamId, Event>
+    where
+        T: Store<StreamId, Event> + Send + Sync,
+        StreamId: Clone + Send + Sync,
+        Event: Message + Clone + Send + Sync,
+    {
+        async fn append(
+            &self,
+            id: StreamId,
+            version_check: Check,
+            events: Vec<Envelope<Event>>,
+        ) -> Result<Version, AppendError> {
+            let new_version = self
+                .store
+                .append(id.clone(), version_check, events.clone())
+                .await?;
+
+            let events_size = events.len();
+            let previous_version = new_version - (events_size as Version);
+
+            let mut persisted_events = events
+                .into_iter()
+                .enumerate()
+                .map(|(i, event)| Persisted {
+                    stream_id: id.clone(),
+                    version: previous_version + (i as Version) + 1,
+                    event,
+                })
+                .collect();
+
+            self.events
+                .write()
+                .expect("acquire lock on recorded events list")
+                .append(&mut persisted_events);
+
+            Ok(new_version)
+        }
+    }
+
+    /// Extension trait that can be used to pull in supertypes implemented
+    /// in this module.
+    pub trait EventStoreExt<StreamId, Event>: Store<StreamId, Event> + Send + Sync + Sized
+    where
+        StreamId: Clone + Send + Sync,
+        Event: Message + Clone + Send + Sync,
+    {
+        /// Returns a [Tracking] instance that decorates the original [Store]
+        /// instance this method has been called on.
+        fn with_recorded_events_tracking(self) -> Tracking<Self, StreamId, Event> {
+            Tracking {
+                store: self,
+                events: Arc::default(),
+            }
+        }
+    }
+
+    impl<T, StreamId, Event> EventStoreExt<StreamId, Event> for T
+    where
+        T: Store<StreamId, Event> + Send + Sync,
+        StreamId: Clone + Send + Sync,
+        Event: Message + Clone + Send + Sync,
+    {
     }
 }
 

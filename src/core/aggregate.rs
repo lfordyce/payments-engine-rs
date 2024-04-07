@@ -2,12 +2,18 @@ use crate::core::store::Version;
 use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 
+/// An Aggregate represents a Domain Model that, through an Aggregate [Root],
+/// acts as a _transactional boundary_.
+///
+/// Since this is an Event-sourced version of the Aggregate pattern,
+/// any change to the Aggregate state must be represented through
+/// a Domain Event, which is then applied to the current state
+/// using the [`Aggregate::apply`] method.
 pub trait Aggregate: Sized + Send + Sync + Clone {
     /// The type used to uniquely identify the Aggregate.
     type Id: Send + Sync;
 
     /// The type of Domain Events that interest this Aggregate.
-    /// Usually, this type should be an `enum`.
     type Event: Message + Send + Sync + Clone;
 
     /// The error type that can be returned by [`Aggregate::apply`] when
@@ -30,14 +36,11 @@ pub trait Aggregate: Sized + Send + Sync + Clone {
 }
 
 /// Represents a piece of domain data that occurs in the system.
-///
-/// Each Message has a specific name to it, which should ideally be
-/// unique within the domain you're operating in. Example: a Domain Event
-/// that represents when an Order was created can have a `name()`: `"OrderWasCreated"`.
 pub trait Message {
     /// Returns the domain name of the [Message].
     fn name(&self) -> &'static str;
 }
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Envelope<T>
@@ -111,7 +114,6 @@ where
 
     /// Returns the list of uncommitted, recorded Domain [Event]s from the [Root]
     /// and resets the internal list to its default value.
-    #[doc(hidden)]
     pub fn take_uncommitted_events(&mut self) -> Vec<Envelope<T::Event>> {
         std::mem::take(&mut self.recorded_events)
     }
@@ -175,21 +177,6 @@ where
             aggregate,
             recorded_events: Vec::default(),
         }
-    }
-
-    /// Rehydrates an [Aggregate Root][Root] from a stream of Domain Events.
-    #[doc(hidden)]
-    pub(crate) fn rehydrate(
-        mut stream: impl Iterator<Item = Envelope<T::Event>>,
-    ) -> Result<Option<Root<T>>, T::Error> {
-        stream.try_fold(None, |ctx: Option<Root<T>>, event| {
-            let new_ctx_result = match ctx {
-                None => Root::<T>::rehydrate_from(event),
-                Some(ctx) => ctx.apply_rehydrated_event(event),
-            };
-
-            Ok(Some(new_ctx_result?))
-        })
     }
 
     /// Rehydrates an [Aggregate Root][Root] from a stream of Domain Events.

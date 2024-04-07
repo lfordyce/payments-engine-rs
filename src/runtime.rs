@@ -1,8 +1,9 @@
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::error::Error as StdError;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -15,7 +16,16 @@ use crate::runtime::sealed::State;
 
 pub trait Read {
     type Request;
-    fn recv(&mut self) -> Result<Self::Request, Box<dyn StdError + Send + Sync + 'static>>;
+    #[allow(clippy::type_complexity)]
+    fn recv(
+        &mut self,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<Self::Request, Box<dyn StdError + Send + Sync + 'static>>>
+                + Send
+                + '_,
+        >,
+    >;
 }
 
 #[derive(Clone)]
@@ -119,7 +129,7 @@ pub struct Runtime<E, S: State> {
     svc: Service,
     connector: HashMap<String, Box<dyn Read<Request = Transaction> + Send>>,
     executor: E,
-    account_ids: HashSet<u16>,
+    account_ids: BTreeSet<u16>,
     _state: PhantomData<S>,
 }
 
@@ -129,7 +139,7 @@ impl Runtime<TokioExecutor, Idle> {
             svc,
             connector: Default::default(),
             executor: TokioExecutor,
-            account_ids: HashSet::new(),
+            account_ids: BTreeSet::new(),
             _state: PhantomData,
         }
     }
@@ -137,7 +147,7 @@ impl Runtime<TokioExecutor, Idle> {
 
 impl<E, S: State> Runtime<E, S> {
     #[inline]
-    pub const fn account_ids(&self) -> &HashSet<u16> {
+    pub const fn account_ids(&self) -> &BTreeSet<u16> {
         &self.account_ids
     }
 }
@@ -160,12 +170,13 @@ impl<E> Runtime<E, Idle> {
     where
         E: Executor,
     {
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = flume::bounded(8192);
+
         for (connector_name, mut connector) in self.connector.drain() {
             let tx = tx.clone();
             self.executor.execute(async move {
-                while let Ok(request) = connector.recv() {
-                    if let Err(err) = tx.send(request) {
+                while let Ok(request) = connector.recv().await {
+                    if let Err(err) = tx.send_async(request).await {
                         eprintln!("connector `{connector_name}` failed: {err}");
                         break;
                     }
@@ -175,7 +186,7 @@ impl<E> Runtime<E, Idle> {
 
         drop(tx);
 
-        while let Ok(request) = rx.recv() {
+        while let Ok(request) = rx.recv_async().await {
             self.account_ids.insert(request.client_id);
             if let Err(err) = self.svc.handle(request.into()).await {
                 tracing::warn!(error=?err, "Error processing transaction:");

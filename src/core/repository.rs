@@ -1,10 +1,12 @@
 use std::fmt::Debug;
 use std::marker::PhantomData;
 
+use crate::core::store::{
+    AppendError, Check, ConflictError, Store, Streamer, Version, VersionSelect,
+};
+use crate::core::{Aggregate, Root};
 use async_trait::async_trait;
 use futures::TryStreamExt;
-use crate::core::{Aggregate, Root};
-use crate::core::store::{AppendError, Check, ConflictError, Store, Streamer, Version, VersionSelect};
 
 /// All possible errors returned by [`Getter::get`].
 #[derive(Debug, thiserror::Error)]
@@ -21,8 +23,8 @@ pub enum GetError {
 /// to load an [aggregate::Root] instance, given its id.
 #[async_trait]
 pub trait Getter<T>: Send + Sync
-    where
-        T: Aggregate,
+where
+    T: Aggregate,
 {
     /// Loads an [aggregate::Root] instance from the data store,
     /// referenced by its unique identifier.
@@ -44,8 +46,8 @@ pub enum SaveError {
 /// to save the latest state of an [aggregate::Root] instance.
 #[async_trait]
 pub trait Saver<T>: Send + Sync
-    where
-        T: Aggregate,
+where
+    T: Aggregate,
 {
     /// Saves a new version of an [aggregate::Root] instance to the data store.
     async fn save(&self, root: &mut Root<T>) -> Result<(), SaveError>;
@@ -54,37 +56,37 @@ pub trait Saver<T>: Send + Sync
 /// A Repository is an object that allows to load and save
 /// an [Aggregate Root][aggregate::Root] from and to a persistent data store.
 pub trait Repository<T>: Getter<T> + Saver<T> + Send + Sync
-    where
-        T: Aggregate,
+where
+    T: Aggregate,
 {
 }
 
 impl<T, R> Repository<T> for R
-    where
-        T: Aggregate,
-        R: Getter<T> + Saver<T> + Send + Sync,
+where
+    T: Aggregate,
+    R: Getter<T> + Saver<T> + Send + Sync,
 {
 }
 
 /// An Event-sourced implementation of the [Repository] interface.
 ///
-/// It uses an [Event Store][event::Store] instance to stream Domain Events
+/// It uses an [Event Store][crate::core::store::Store] instance to stream Domain Events
 /// for a particular Aggregate, and append uncommitted Domain Events
 /// recorded by an Aggregate Root.
 #[derive(Debug, Clone)]
 pub struct EventSourced<T, S>
-    where
-        T: Aggregate,
-        S: Store<T::Id, T::Event>,
+where
+    T: Aggregate,
+    S: Store<T::Id, T::Event>,
 {
     store: S,
     aggregate: PhantomData<T>,
 }
 
 impl<T, S> From<S> for EventSourced<T, S>
-    where
-        T: Aggregate,
-        S: Store<T::Id, T::Event>,
+where
+    T: Aggregate,
+    S: Store<T::Id, T::Event>,
 {
     fn from(store: S) -> Self {
         Self {
@@ -96,13 +98,12 @@ impl<T, S> From<S> for EventSourced<T, S>
 
 #[async_trait]
 impl<T, S> Getter<T> for EventSourced<T, S>
-    where
-        T: Aggregate,
-        T::Id: Clone,
-        T::Error: std::error::Error + Send + Sync + 'static,
-        S: Store<T::Id, T::Event>,
-        <S as Streamer<T::Id, T::Event>>::Error:
-        std::error::Error + Send + Sync + 'static,
+where
+    T: Aggregate,
+    T::Id: Clone,
+    T::Error: std::error::Error + Send + Sync + 'static,
+    S: Store<T::Id, T::Event>,
+    <S as Streamer<T::Id, T::Event>>::Error: std::error::Error + Send + Sync + 'static,
 {
     async fn get(&self, id: &T::Id) -> Result<Root<T>, GetError> {
         let stream = self
@@ -121,10 +122,10 @@ impl<T, S> Getter<T> for EventSourced<T, S>
 
 #[async_trait]
 impl<T, S> Saver<T> for EventSourced<T, S>
-    where
-        T: Aggregate,
-        T::Id: Clone,
-        S: Store<T::Id, T::Event>,
+where
+    T: Aggregate,
+    T::Id: Clone,
+    S: Store<T::Id, T::Event>,
 {
     async fn save(&self, root: &mut Root<T>) -> Result<(), SaveError> {
         let events_to_commit = root.take_uncommitted_events();
@@ -134,8 +135,7 @@ impl<T, S> Saver<T> for EventSourced<T, S>
             return Ok(());
         }
 
-        let current_event_stream_version =
-            root.version() - (events_to_commit.len() as Version);
+        let current_event_stream_version = root.version() - (events_to_commit.len() as Version);
 
         self.store
             .append(

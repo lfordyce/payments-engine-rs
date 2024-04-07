@@ -22,6 +22,7 @@ pub enum Status {
     #[default]
     Ok,
     Disputed,
+    Resolved,
     ChargedBack,
     Declined,
 }
@@ -112,24 +113,18 @@ pub enum BankAccountError {
     NotOpenedYet,
     #[error("bank account has already been opened")]
     AlreadyOpened,
-    #[error("empty id provided for the new bank account")]
-    EmptyAccountId,
-    #[error("empty account holder id provided for the new bank account")]
-    EmptyAccountHolderId,
     #[error("a deposit was attempted with negative import")]
     NegativeDepositAttempted,
     #[error("no money to deposit has been specified")]
     NoMoneyDeposited,
     #[error("transfer could not be sent due to insufficient funds")]
     InsufficientFunds,
-    #[error("Associated Transaction `{0}` is missing an amount when one is expected")]
-    MissingAmount(u32),
     #[error("transfer transaction was destined to a different recipient: {0}")]
     WrongTransactionRecipient(u32),
+    #[error("duplicate transaction: {0}")]
+    DuplicateTransactionRecipient(u32),
     #[error("the account is closed")]
     Closed,
-    #[error("bank account has already been closed")]
-    AlreadyClosed,
 }
 
 /// Balance for the account
@@ -187,12 +182,20 @@ impl Aggregate for Account {
                     transaction,
                     tx_id,
                     account_holder_id,
-                } => Ok(Account {
-                    id: account_holder_id,
-                    balance: Balance::new(transaction.amount.ok_or(BankAccountError::NoMoneyDeposited)?),
-                    pending_transactions: HashMap::from([(tx_id, transaction)]),
-                    locked: false,
-                }),
+                } => {
+                    let amount = transaction
+                        .amount
+                        .ok_or(BankAccountError::NoMoneyDeposited)?;
+                    if amount < Decimal::ZERO {
+                        return Err(BankAccountError::NegativeDepositAttempted);
+                    }
+                    Ok(Account {
+                        id: account_holder_id,
+                        balance: Balance::new(amount),
+                        pending_transactions: HashMap::from([(tx_id, transaction)]),
+                        locked: false,
+                    })
+                }
                 _ => Err(BankAccountError::NotOpenedYet),
             },
             Some(mut account) => match event {
@@ -221,7 +224,8 @@ impl Aggregate for Account {
                     match account
                         .pending_transactions
                         .entry(tx_id)
-                        .and_modify(|tx| tx.status = Status::Disputed) {
+                        .and_modify(|tx| tx.status = Status::Disputed)
+                    {
                         Entry::Occupied(t) => match t.get().transaction_type {
                             TransactionType::Deposit => {
                                 account.balance.held += amount;
@@ -245,6 +249,7 @@ impl Aggregate for Account {
                         Entry::Occupied(t) => match t.get().transaction_type {
                             TransactionType::Deposit => {
                                 account.balance.held -= amount;
+                                account.balance.available += amount;
                             }
                             TransactionType::Withdrawal => {
                                 account.balance.held -= amount;
@@ -264,8 +269,10 @@ impl Aggregate for Account {
                     {
                         Entry::Occupied(t) => match t.get().transaction_type {
                             TransactionType::Deposit | TransactionType::Withdrawal => {
-                                account.balance.held -= amount;
-                                account.locked = true;
+                                if account.balance.held >= amount {
+                                    account.balance.held -= amount;
+                                    account.locked = true;
+                                }
                             }
                             _ => {}
                         },
@@ -319,9 +326,20 @@ impl BankAccountRoot {
         if self.locked {
             return Err(BankAccountError::Closed);
         }
+        let amount = transaction
+            .amount
+            .ok_or(BankAccountError::NoMoneyDeposited)?;
+        if amount < Decimal::ZERO {
+            return Err(BankAccountError::NegativeDepositAttempted);
+        }
+        if self.pending_transactions.get(&transaction.tx_id).is_some() {
+            return Err(BankAccountError::DuplicateTransactionRecipient(
+                transaction.tx_id,
+            ));
+        }
         self.record_that(
             TransactionEvent::DepositWasRecorded {
-                amount: transaction.amount.ok_or(BankAccountError::NoMoneyDeposited)?,
+                amount,
                 transaction,
             }
             .into(),
@@ -332,13 +350,26 @@ impl BankAccountRoot {
         if self.locked {
             return Err(BankAccountError::Closed);
         }
-        if self.balance.available < transaction.amount.ok_or(BankAccountError::NoMoneyDeposited)? {
+        let amount = transaction
+            .amount
+            .ok_or(BankAccountError::NoMoneyDeposited)?;
+        if amount < Decimal::ZERO {
+            return Err(BankAccountError::NegativeDepositAttempted);
+        }
+
+        if self.balance.available < amount {
             return Err(BankAccountError::InsufficientFunds);
+        }
+
+        if self.pending_transactions.get(&transaction.tx_id).is_some() {
+            return Err(BankAccountError::DuplicateTransactionRecipient(
+                transaction.tx_id,
+            ));
         }
 
         self.record_that(
             TransactionEvent::WithdrawalWasRecorded {
-                amount: transaction.amount.ok_or(BankAccountError::NoMoneyDeposited)?,
+                amount,
                 transaction,
             }
             .into(),
@@ -346,53 +377,56 @@ impl BankAccountRoot {
     }
 
     pub fn dispute(&mut self, transaction: Transaction) -> Result<(), BankAccountError> {
+        if self.locked {
+            return Err(BankAccountError::Closed);
+        }
         match self.pending_transactions.get(&transaction.tx_id) {
-            Some(disputed_tx) => {
-                if disputed_tx.can_be_disputed() {
-                    let disputed = disputed_tx.clone();
-                    self.record_that(
-                        TransactionEvent::DisputeWasRecorded {
-                            tx_id: disputed.tx_id,
-                            amount: disputed.amount.ok_or(BankAccountError::NoMoneyDeposited)?,
-                        }
-                        .into(),
-                    )
-                } else {
-                    Err(BankAccountError::InsufficientFunds)
-                }
+            Some(disputed_tx) if disputed_tx.can_be_disputed() => {
+                tracing::info!("disputed transaction {:?}", disputed_tx);
+                let disputed = disputed_tx.clone();
+                self.record_that(
+                    TransactionEvent::DisputeWasRecorded {
+                        tx_id: disputed.tx_id,
+                        amount: disputed.amount.ok_or(BankAccountError::NoMoneyDeposited)?,
+                    }
+                    .into(),
+                )
             }
-            None => Err(BankAccountError::WrongTransactionRecipient(
+            _ => Err(BankAccountError::WrongTransactionRecipient(
                 transaction.tx_id,
             )),
         }
     }
 
     pub fn resolve(&mut self, transaction: Transaction) -> Result<(), BankAccountError> {
+        if self.locked {
+            return Err(BankAccountError::Closed);
+        }
         match self.pending_transactions.get(&transaction.tx_id) {
-            Some(disputed_tx) => {
-                if disputed_tx.can_complete_dispute() {
-                    let disputed = disputed_tx.clone();
-                    self.record_that(
-                        TransactionEvent::ResolveWasRecorded {
-                            amount: disputed.amount.ok_or(BankAccountError::NoMoneyDeposited)?,
-                            tx_id: disputed.tx_id,
-                        }
-                        .into(),
-                    )
-                } else {
-                    Err(BankAccountError::InsufficientFunds)
-                }
+            Some(disputed_tx) if disputed_tx.can_complete_dispute() => {
+                let disputed = disputed_tx.clone();
+                self.record_that(
+                    TransactionEvent::ResolveWasRecorded {
+                        amount: disputed.amount.ok_or(BankAccountError::NoMoneyDeposited)?,
+                        tx_id: disputed.tx_id,
+                    }
+                    .into(),
+                )
             }
-            None => Err(BankAccountError::WrongTransactionRecipient(
+            _ => Err(BankAccountError::WrongTransactionRecipient(
                 transaction.tx_id,
             )),
         }
     }
 
     pub fn chargeback(&mut self, transaction: Transaction) -> Result<(), BankAccountError> {
+        if self.locked {
+            return Err(BankAccountError::Closed);
+        }
         match self.pending_transactions.get(&transaction.tx_id) {
             Some(disputed_tx) if disputed_tx.can_complete_dispute() => {
                 let disputed = disputed_tx.clone();
+                tracing::info!("chargeback recorded {:?}", disputed_tx);
                 self.record_that(
                     TransactionEvent::ChargebackWasRecorded {
                         amount: disputed.amount.ok_or(BankAccountError::NoMoneyDeposited)?,
@@ -422,8 +456,8 @@ impl BankAccountRoot {
 mod tests {
     use rust_decimal_macros::dec;
 
-    use crate::core::{EventSourced, GetError, InMemory};
     use crate::core::repository::{Getter, Saver};
+    use crate::core::{EventSourced, GetError, InMemory};
 
     use super::*;
 
@@ -432,7 +466,7 @@ mod tests {
         let event_store = InMemory::<u16, TransactionEvent>::default();
         let account_repository = EventSourced::<Account, _>::from(event_store);
 
-        let mut dpstt = Transaction {
+        let dpstt = Transaction {
             status: Default::default(),
             client_id: 1,
             tx_id: 1,
@@ -447,14 +481,14 @@ mod tests {
                     root.deposit(dpstt.clone()).unwrap();
                     account_repository.save(&mut root).await.unwrap();
                 }
-                Err(err) if matches!(GetError::NotFound, err) => {
+                Err(_err) if matches!(GetError::NotFound, _err) => {
                     let mut root = BankAccountRoot::open(dpstt.clone()).expect("new account root");
                     account_repository
                         .save(&mut root)
                         .await
                         .expect("new account version should be saved successfully");
                 }
-                Err(err) => {}
+                Err(_err) => {}
             };
         }
 
