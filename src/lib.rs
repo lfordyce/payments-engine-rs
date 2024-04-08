@@ -7,7 +7,7 @@ use clap::Parser;
 use csv::Trim;
 use either::Either;
 use futures::TryFutureExt;
-use tap::Pipe;
+use tap::{Pipe, TapFallible as _};
 
 use crate::cli::{Args, InputType, ProcessingError};
 use crate::core::repository::Getter;
@@ -29,7 +29,7 @@ impl From<InputType> for InputProcessor {
         let (tx, rx) = flume::bounded(128 * 1024);
 
         std::thread::spawn(move || -> Result<(), ProcessingError> {
-            let mut rdr = match value {
+            let rdr = match value {
                 InputType::File(path) => Either::Left(std::fs::File::open(path)?),
                 InputType::Stdin => Either::Right(io::stdin()),
             }
@@ -39,8 +39,16 @@ impl From<InputType> for InputProcessor {
                     .flexible(true)
                     .from_reader(either_reader)
             });
-            for result in rdr.deserialize() {
-                let record: Transaction = result?;
+
+            for record in rdr
+                .into_deserialize::<Transaction>()
+                .map(|record| {
+                    record
+                        .tap_err(|err| tracing::error!(error=?err, "Error parsing CSV records"))
+                        .map_err(ProcessingError::from)
+                })
+                .map_while(Result::ok)
+            {
                 tx.send(record)?
             }
 
