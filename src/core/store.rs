@@ -188,7 +188,7 @@ where
             .event_streams
             .get(id)
             .cloned()
-            .unwrap_or_default() // NOTE: the new Vec is empty, so there will be no memory allocation!
+            .unwrap_or_default()
             .into_iter()
             .filter(move |evt| match select {
                 VersionSelect::All => true,
@@ -272,7 +272,7 @@ pub mod __tracking {
     /// Decorator type for an [`event::Store`] implementation that tracks the list of
     /// recorded Domain Events through it.
     ///
-    /// Useful for testing purposes, i.e. asserting that Domain Events written throguh
+    /// Useful for testing purposes, i.e. asserting that Domain Events written through
     /// this Event Store instance are the ones expected.
     #[derive(Debug, Clone)]
     pub struct Tracking<T, StreamId, Event>

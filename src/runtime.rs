@@ -59,10 +59,11 @@ impl Handler<Transaction> for Service {
                     self.repository.save(&mut root).await?
                 }
                 Err(_err) if matches!(GetError::NotFound, _err) => {
+                    tracing::debug!("creating new account: {:?}", &command.client_id);
                     let mut root = BankAccountRoot::open(command.clone())?;
                     self.repository.save(&mut root).await?
                 }
-                Err(_err) => (),
+                Err(err) => return Err(anyhow::Error::from(err)),
             },
             TransactionType::Withdrawal => {
                 let mut root: BankAccountRoot =
@@ -177,7 +178,7 @@ impl<E> Runtime<E, Idle> {
             self.executor.execute(async move {
                 while let Ok(request) = connector.recv().await {
                     if let Err(err) = tx.send_async(request).await {
-                        eprintln!("connector `{connector_name}` failed: {err}");
+                        tracing::warn!("ingest connector `{connector_name}` failed: {err}");
                         break;
                     }
                 }
