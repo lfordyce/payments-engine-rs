@@ -259,19 +259,9 @@ impl Aggregate for Account {
                         .and_modify(|tx| tx.status = Status::Ok)
                     {
                         Entry::Occupied(t) => match t.get().transaction_type {
-                            // TransactionType::Deposit | TransactionType::Withdrawal
-                            //     if account.balance.held >= amount =>
-                            // {
-                            //     account.balance.held -= amount;
-                            //     account.balance.available += amount;
-                            //     Ok(account)
-                            // }
-                            TransactionType::Deposit => {
-                                account.balance.held -= amount;
-                                account.balance.available += amount;
-                                Ok(account)
-                            }
-                            TransactionType::Withdrawal => {
+                            TransactionType::Deposit | TransactionType::Withdrawal
+                                if account.balance.held >= amount =>
+                            {
                                 account.balance.held -= amount;
                                 account.balance.available += amount;
                                 Ok(account)
