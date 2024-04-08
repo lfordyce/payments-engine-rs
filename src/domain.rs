@@ -29,19 +29,20 @@ pub enum Status {
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Clone, Eq)]
 pub struct Transaction {
-    /// Used internally
+    /// Used internally for informing the Account state if a [`Transaction`] is disputable or resolvable.
     #[serde(skip, default)]
     pub status: Status,
-    /// Client ID
+    /// Client ID.
     #[serde(rename = "client")]
     pub client_id: u16,
-    /// Transaction ID
+    /// Transaction ID.
     #[serde(rename = "tx")]
     pub tx_id: u32,
-    /// Transaction type ( deposit, withdrawal, dispute, etc.)
+    /// The [`TransactionType`] variant.
     #[serde(rename = "type")]
     pub transaction_type: TransactionType,
-    /// Transaction amount, if withdrawal or deposit type
+    /// The [`Transaction`] amount.
+    /// It will be enforced only for [`TransactionType::Deposit`] and [`TransactionType::Withdrawal`]
     pub amount: Option<Decimal>,
 }
 
@@ -233,12 +234,7 @@ impl Aggregate for Account {
                         .and_modify(|tx| tx.status = Status::Disputed)
                     {
                         Entry::Occupied(t) => match t.get().transaction_type {
-                            TransactionType::Deposit => {
-                                account.balance.available -= amount;
-                                account.balance.held += amount;
-                                Ok(account)
-                            }
-                            TransactionType::Withdrawal => {
+                            TransactionType::Deposit | TransactionType::Withdrawal => {
                                 if account.balance.available >= amount {
                                     account.balance.available -= amount;
                                 }

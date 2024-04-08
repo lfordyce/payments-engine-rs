@@ -67,3 +67,25 @@ fn smoke_test() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[test]
+fn process_many_records() -> Result<(), Box<dyn std::error::Error>> {
+    let mut cmd = Command::cargo_bin("payments-engine-rs")?;
+    cmd.arg("./etc/process_many.csv");
+    let stdout = String::from_utf8(cmd.assert().success().get_output().stdout.clone())?;
+
+    insta::assert_snapshot!(stdout);
+
+    Ok(())
+}
+
+#[test]
+fn same_tx_id_attempt() -> Result<(), Box<dyn std::error::Error>> {
+    let mut cmd = Command::cargo_bin("payments-engine-rs")?;
+    cmd.arg("./etc/same_tx_id.csv");
+    let stdout = String::from_utf8(cmd.assert().success().get_output().stdout.clone())?;
+
+    insta::assert_snapshot!(stdout);
+
+    Ok(())
+}
